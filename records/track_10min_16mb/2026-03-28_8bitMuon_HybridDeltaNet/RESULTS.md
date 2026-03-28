@@ -46,4 +46,10 @@ Focus: Optimize within the proven baseline architecture. Sweep LR, warmdown, mod
 
 | Run | val_bpb | val_loss | total_steps | step_avg_ms | config delta vs baseline | notes |
 |-----|---------|----------|-------------|-------------|--------------------------|-------|
-| (pending) | | | | | | |
+| phase5a (MATRIX_LR=0.03) | **1.3481** | 2.2762 | 958 | 626.40 | LR 0.025->0.03 | -0.0172 vs baseline |
+| phase5b (MATRIX_LR=0.035) | **1.3336** | 2.2517 | 957 | 627.45 | LR 0.025->0.035 | -0.0317 vs baseline |
+| phase5c (MATRIX_LR=0.04) | **1.3245** | 2.2363 | 958 | 626.51 | LR 0.025->0.04 | -0.0408 vs baseline, best so far |
+
+### Phase 5 Conclusions (so far)
+
+LR sweep shows consistent improvement from 0.025 to 0.04. Still improving — next steps would be LR=0.05, warmdown sweeps, and model dim/depth sweeps.
