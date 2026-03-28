@@ -782,13 +782,13 @@ class GatedDeltaNetAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         # Beta gating: per-head scalar controlling delta rule update strength
         beta = torch.sigmoid(self.beta_proj(x))  # (bsz, seqlen, num_heads)
-        # Transpose to (bsz, num_heads, seqlen, head_dim) for fla kernel
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-        beta = beta.transpose(1, 2).contiguous()
-        y, _ = chunk_delta_rule(q, k, v, beta)
-        y = y.transpose(1, 2).reshape(bsz, seqlen, dim)
+        # fla chunk_delta_rule expects (B, T, H, D) with head_first=False (default)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        beta = beta.contiguous()
+        y, _ = chunk_delta_rule(q, k, v, beta, head_first=False, use_qk_l2norm_in_kernel=True)
+        y = y.reshape(bsz, seqlen, dim)
         return F.linear(y, out_w.to(x.dtype)), None
 
 class SmearGate(nn.Module):
@@ -1161,7 +1161,7 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=not getattr(base_model, '_deltanet_enabled', False))
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1632,7 +1632,8 @@ def main() -> None:
     log0(f"deltanet:enabled={args.deltanet_enabled} deltanet_layers={deltanet_layers} attn_layers={attn_layers}")
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    _fullgraph = not args.deltanet_enabled
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=_fullgraph)
     model = compiled_model
 
     # Optimizer split:
@@ -1978,7 +1979,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=not getattr(eval_model, '_deltanet_enabled', False))
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
