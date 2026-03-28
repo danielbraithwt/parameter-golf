@@ -8,4 +8,7 @@ data/manifest.json
 data/docs_selected.jsonl
 .mypy_cache/
 .venv
-logs/
+logs/records/track_10min_16mb/2026-03-28_8bitMuon_HybridDeltaNet/final_model.pt
+records/track_10min_16mb/2026-03-28_8bitMuon_HybridDeltaNet/final_model.int6.ptz
+final_model.pt
+final_model.int8.ptz
