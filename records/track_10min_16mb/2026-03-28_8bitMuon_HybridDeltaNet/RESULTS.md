@@ -11,13 +11,21 @@ Note: Absolute scores will be worse than 8-GPU runs due to fewer steps in 10-min
 
 ## Phase 2: Hybrid DeltaNet Sweep
 
-Fixed: added `use_qk_l2norm_in_kernel=True` and `fullgraph=False` for torch.compile compatibility.
+Rewrote GatedDeltaNetAttention with proper architecture: Mamba-style alpha decay gate, per-head beta, output gating (RMSNorm + SiLU), using fla `chunk_gated_delta_rule` kernel with `use_qk_l2norm_in_kernel=True`.
 
 | Run | val_bpb | val_loss | compressed_size | total_steps | step_avg_ms | notes |
 |-----|---------|----------|-----------------|-------------|-------------|-------|
-| phase2a (full_attn=3,7,10) | pending | | | | | 8 DeltaNet + 3 full attn layers |
-| phase2b (full_attn=5,10) | pending | | | | | 9 DeltaNet + 2 full attn layers |
-| phase2c (full_attn=10) | pending | | | | | 10 DeltaNet + 1 full attn layer |
+| phase2a_v1 (broken, no alpha gate) | 1.6507 | 2.7871 | 5.4MB | 525 | 1143.30 | Old impl, chunk_delta_rule, no gating |
+| phase2a_v2 (proper GatedDeltaNet) | **2.0185** | 3.4081 | 5.8MB | 307 | 1956.10 | Full impl, 3x slower than baseline |
+| phase2b, 2c | SKIPPED | | | | | DeltaNet too slow on 1GPU to be competitive |
+
+### Phase 2 Conclusions
+
+DeltaNet is a **dead end** for the 1xH100 / 10-min constrained setting:
+- `fullgraph=False` (required for fla kernel) loses torch.compile optimizations
+- fla chunk_gated_delta_rule kernel is ~3x slower per step than flash attention
+- Even with better per-step learning, far fewer total steps -> worse final bpb
+- Would need 8 GPUs to make the speed tradeoff viable
 
 ## Phase 3: 8-bit Muon + Low-Rank Sweep
 
@@ -27,20 +35,14 @@ Fixed: added `use_qk_l2norm_in_kernel=True` and `fullgraph=False` for torch.comp
 | phase3b (int8 + rank64) | **2.5194** | 4.2538 | 4.8MB | 234 | 2573.49 | 21604 | SVD way too slow (4x), dead end |
 | phase3c (int8 + rank128) | SKIPPED | | | | | | Would be even slower than rank64 |
 
-## Phase 3 Conclusions
+### Phase 3 Conclusions
 
 - **int8 momentum**: Marginal degradation (+0.0125 bpb), no speed/memory benefit on 1 GPU. Not worth it.
 - **Low-rank SVD truncation**: Fatal step time penalty (4x slower). Dead end.
 
-## Phase 4: Combined Best
+## Phase 5: Hyperparameter Sweeps (baseline architecture)
 
-| Run | val_bpb | val_loss | compressed_size | total_steps | notes |
-|-----|---------|----------|-----------------|-------------|-------|
-| (TBD after Phase 2 DeltaNet results) | | | | | |
-
-## Additional Sweeps
-
-### Hyperparameter Sweeps (Phase 5)
+Focus: Optimize within the proven baseline architecture. Sweep LR, warmdown, model width/depth, MLP mult.
 
 | Run | val_bpb | val_loss | total_steps | step_avg_ms | config delta vs baseline | notes |
 |-----|---------|----------|-------------|-------------|--------------------------|-------|

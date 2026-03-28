@@ -26,7 +26,7 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 try:
-    from fla.ops.delta_rule import chunk_delta_rule
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     HAS_FLA = True
 except ImportError:
     HAS_FLA = False
@@ -440,7 +440,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,beta_proj",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,beta_proj,A_log,dt_bias,W_alpha,out_norm",
     ).split(",")
     if pattern
 )
@@ -749,20 +749,35 @@ class CausalSelfAttention(nn.Module):
         return F.linear(y, out_w.to(x.dtype)), raw_v
 
 class GatedDeltaNetAttention(nn.Module):
-    """Gated DeltaNet linear attention using fla-org chunk_delta_rule kernel."""
+    """Gated DeltaNet: linear attention with Mamba-style decay gate, beta update gate, and output gating.
+    Uses fla chunk_gated_delta_rule kernel for O(Td^2) chunked recurrence."""
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  qk_gain_init: float, beta_init: float = 2.0):
         super().__init__()
         if not HAS_FLA:
-            raise ImportError("fla-core is required for DeltaNet: pip install fla-core")
+            raise ImportError("fla-core is required for GatedDeltaNet: pip install fla-core")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.use_xsa = False
+
+        # Beta gate: per-head update strength for delta rule
         self.beta_proj = nn.Linear(dim, num_heads, bias=True)
         nn.init.zeros_(self.beta_proj.weight)
         nn.init.constant_(self.beta_proj.bias, beta_init)
-        self.use_xsa = False  # DeltaNet never uses XSA
+
+        # Alpha decay gate (Mamba-style): g = -A_log.exp() * softplus(W_alpha(x) + dt_bias)
+        self.W_alpha = nn.Linear(dim, num_heads, bias=False)
+        nn.init.zeros_(self.W_alpha.weight)
+        self.dt_bias = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
+        A_init = torch.empty(num_heads, dtype=torch.float32).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A_init))
+
+        # Output gate: RMSNorm + SiLU gating
+        self.gate_proj = nn.Linear(dim, dim, bias=False)
+        nn.init.ones_(self.gate_proj.weight)
+        self.out_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
+
     def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor,
                 v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         bsz, seqlen, dim = x.shape
@@ -772,23 +787,36 @@ class GatedDeltaNetAttention(nn.Module):
         if v_embed is not None:
             v = v + v_embed
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+
         # Expand KV heads to match Q heads (GQA -> MHA for DeltaNet)
         if self.num_kv_heads < self.num_heads:
             rep = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(rep, dim=2)
             v = v.repeat_interleave(rep, dim=2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        # Beta gating: per-head scalar controlling delta rule update strength
-        beta = torch.sigmoid(self.beta_proj(x))  # (bsz, seqlen, num_heads)
-        # fla chunk_delta_rule expects (B, T, H, D) with head_first=False (default)
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        beta = beta.contiguous()
-        y, _ = chunk_delta_rule(q, k, v, beta, head_first=False, use_qk_l2norm_in_kernel=True)
+
+        # Beta: per-head update strength
+        beta = torch.sigmoid(self.beta_proj(x).float())  # (B, T, H)
+
+        # Alpha decay gate in log space (Mamba-style)
+        g = -self.A_log.float().exp() * F.softplus(self.W_alpha(x).float() + self.dt_bias)  # (B, T, H)
+
+        # Output gate
+        gate = self.gate_proj(x)  # (B, T, D)
+
+        # chunk_gated_delta_rule: q,k,v: (B, T, H, D), g: (B, T, H), beta: (B, T, H)
+        # L2 norm applied inside kernel for numerical stability
+        y, _ = chunk_gated_delta_rule(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            g.contiguous(), beta.contiguous(),
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        # Output: RMSNorm per head + SiLU gating
+        y = self.out_norm(y)  # (B, T, H, D)
+        gate = gate.reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        y = y * F.silu(gate)
         y = y.reshape(bsz, seqlen, dim)
+
         return F.linear(y, out_w.to(x.dtype)), None
 
 class SmearGate(nn.Module):
